@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Auto-split SpongeBob-style merged (~22min) MKVs into two (~11min) episodes.
+# Uses black screen detection to find the midpoint boundary (lossless split).
+#
+# Input filename expected (example):
+#   SpongeBob SquarePants (1999) - S02E01-E02 - Something Smells & Bossy Boots (1080p AMZN WEB-DL x265 RCVR).mkv
+#
+# Output filenames (keeps quality tag):
+#   SpongeBob SquarePants (1999) - S02E01 - Something Smells (1080p AMZN WEB-DL x265 RCVR).mkv
+#   SpongeBob SquarePants (1999) - S02E02 - Bossy Boots (1080p AMZN WEB-DL x265 RCVR).mkv
+#
+# Requirements: ffmpeg (macOS: via Homebrew / linux)
+
+# -------------------------
+# Tunables (for SpongeBob 22-min merged files)
+# -------------------------
+DESIRED_SPLIT=660  # target boundary near 11:00 in seconds
+
+# Only consider black_start times within this window (seconds)
+WIN_LO=420         # earliest allowed boundary (~7:00)
+WIN_HI=900         # latest allowed boundary (~15:00)
+
+# Black detect sensitivity
+MIN_BLACK_DUR=0.70 # ignore fades shorter than this duration
+PIC_TH=0.98        # how "black" pixels must be (higher = stricter)
+BLACK_MIN_D=0.80   # black must last at least this long to be detected
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") /path/to/SeasonFolder --season NN [--out /path/to/output] [--dry-run]
+
+EOF
+}
+
+if [[ $# -lt 1 ]]; then usage; exit 1; fi
+
+SEASON_DIR="$1"; shift
+SEASON_NUM=""
+OUT_DIR=""
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --season) SEASON_NUM="$2"; shift 2 ;;
+    --out) OUT_DIR="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+if [[ ! -d "$SEASON_DIR" ]]; then
+  echo "ERROR: Not a directory: $SEASON_DIR"
+  exit 1
+fi
+
+if [[ -z "$SEASON_NUM" ]]; then
+  echo "ERROR: Please pass --season NN (e.g., --season 02)."
+  exit 1
+fi
+
+if [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="$SEASON_DIR/Split"
+fi
+mkdir -p "$OUT_DIR"
+
+command -v ffmpeg >/dev/null 2>&1 || { echo "ERROR: ffmpeg not found in PATH."; exit 1; }
+
+LOG_FILE="$OUT_DIR/split_log.txt"
+: > "$LOG_FILE"
+
+echo "== SpongeBob 22-min Auto Split (keep quality tag) =="
+echo "Season dir : $SEASON_DIR"
+echo "Season     : $SEASON_NUM"
+echo "Output dir : $OUT_DIR"
+echo "Log        : $LOG_FILE"
+echo
+
+trim() { sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+
+sanitize_title() {
+  # Keep it Plex/mac-friendly: remove slashes and colons; collapse spaces.
+  echo "$1" | sed -E 's/[\/:]/ - /g; s/[[:space:]]+/ /g' | trim
+}
+
+# Choose the best split time near DESIRED_SPLIT within [WIN_LO, WIN_HI]
+choose_mid_split() {
+  local best=""
+  local best_dist=""
+
+  while read -r s d; do
+    # ignore short black segments
+    if awk -v dur="$d" -v min="$MIN_BLACK_DUR" 'BEGIN{exit !(dur>=min)}'; then :; else continue; fi
+    # keep only candidates in window
+    if awk -v s="$s" -v lo="$WIN_LO" -v hi="$WIN_HI" 'BEGIN{exit !(s>=lo && s<=hi)}'; then :; else continue; fi
+
+    local dist
+    dist=$(awk -v s="$s" -v des="$DESIRED_SPLIT" 'BEGIN{d=s-des; if(d<0)d=-d; printf "%.3f", d}')
+    if [[ -z "$best" ]] || awk -v a="$dist" -v b="$best_dist" 'BEGIN{exit !(a<b)}'; then
+      best="$s"
+      best_dist="$dist"
+    fi
+  done
+
+  echo "$best"
+}
+
+# Get sorted list of MKVs
+FILES=()
+while IFS= read -r line; do
+  FILES+=( "$line" )
+done < <(ls -1 "$SEASON_DIR"/*.mkv "$SEASON_DIR"/*.MKV 2>/dev/null | sort)
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "No MKV files found in: $SEASON_DIR"
+  exit 0
+fi
+
+for f in "${FILES[@]}"; do
+  echo "----"
+  echo "Input: $(basename "$f")"
+
+  tmp_black="$(mktemp)"
+  ffmpeg -hide_banner -i "$f" \
+    -vf "blackdetect=d=${BLACK_MIN_D}:pic_th=${PIC_TH}" \
+    -an -f null - 2> "$tmp_black" || true
+
+  # macOS-safe parsing: extract "black_start" and "black_duration" from ffmpeg output
+  candidates="$(awk '
+    /black_start:/ {
+      start=""; dur="";
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^black_start:/) { split($i, a, ":"); start=a[2]; }
+        if ($i ~ /^black_duration:/) { split($i, b, ":"); dur=b[2]; }
+      }
+      if (start != "" && dur != "") print start, dur;
+    }
+  ' "$tmp_black")"
+  rm -f "$tmp_black"
+
+  if [[ -z "$candidates" ]]; then
+    echo "WARN: No black segments detected. Skipping." | tee -a "$LOG_FILE"
+    continue
+  fi
+
+  split_time="$(printf "%s\n" "$candidates" | choose_mid_split)"
+
+  if [[ -z "$split_time" ]]; then
+    echo "WARN: No suitable midpoint black segment found (window ${WIN_LO}-${WIN_HI}s). Skipping." | tee -a "$LOG_FILE"
+    continue
+  fi
+
+  echo "Chosen split time (s): $split_time"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[DRY RUN] Would split at $split_time and write two episode files."
+    continue
+  fi
+
+  workdir="$(mktemp -d)"
+  out_pattern="$workdir/out_%03d.mkv"
+
+  # Lossless 2-part split at the chosen timestamp
+  ffmpeg -hide_banner -i "$f" -map 0 -c copy \
+    -f segment -segment_times "$split_time" -reset_timestamps 1 \
+    "$out_pattern" </dev/null
+
+  outs=()
+while IFS= read -r line; do
+  outs+=( "$line" )
+done < <(ls -1 "$workdir"/out_*.mkv 2>/dev/null | sort)
+
+  if [[ ${#outs[@]} -ne 2 ]]; then
+    echo "WARN: Expected 2 segments, got ${#outs[@]}. Skipping output." | tee -a "$LOG_FILE"
+    rm -rf "$workdir"
+    continue
+  fi
+
+  # ---- Rename outputs according to input filename structure, KEEPING quality tag ----
+  base="$(basename "$f")"
+  name_no_ext="${base%.mkv}"
+  name_no_ext="${name_no_ext%.MKV}"
+
+  # Parse:
+  #  1: show+year prefix      "SpongeBob SquarePants (1999)"
+  #  2: episode A             "S02E01"
+  #  3: episode B number      "02"
+  #  4: titles+rest           "Something Smells & Bossy Boots (1080p ...)"
+  if [[ "$name_no_ext" =~ ^(.+)\ -\ (S[0-9]{2}E[0-9]{2})-E([0-9]{2})\ -\ (.+)$ ]]; then
+    show_year="${BASH_REMATCH[1]}"
+    epA_full="${BASH_REMATCH[2]}"       # e.g. S02E01
+    epB_num="${BASH_REMATCH[3]}"        # e.g. 02
+    titles_rest="${BASH_REMATCH[4]}"    # e.g. "Something Smells & Bossy Boots (1080p ...)"
+  else
+    echo "WARN: Filename didn't match expected pattern; leaving generic names for: $base" | tee -a "$LOG_FILE"
+    # Fall back to generic names in output folder
+    mv -f "${outs[0]}" "$OUT_DIR/${name_no_ext} - part1.mkv"
+    mv -f "${outs[1]}" "$OUT_DIR/${name_no_ext} - part2.mkv"
+    rm -rf "$workdir"
+    continue
+  fi
+
+  # Build epB_full = "S02E02" (reuse season portion from epA_full)
+  season_part="${epA_full:0:3}"         # "S02"
+  epB_full="${season_part}E${epB_num}"  # "S02E02"
+
+  # Extract optional quality tag "(...)"
+  quality="$(echo "$titles_rest" | sed -nE 's/^.*(\(.*\))$/\1/p')"
+  titles_only="$(echo "$titles_rest" | sed -E 's/[[:space:]]*\(.*\)$//')"
+
+  # Split titles on " & " (common)
+  titleA="$(echo "$titles_only" | awk -F' & ' '{print $1}' | trim)"
+  titleB="$(echo "$titles_only" | awk -F' & ' '{print $2}' | trim)"
+
+  # Fallback if separator isn't exactly " & "
+  if [[ -z "${titleB:-}" ]]; then
+    titleA="$(echo "$titles_only" | awk -F' and ' '{print $1}' | trim)"
+    titleB="$(echo "$titles_only" | awk -F' and ' '{print $2}' | trim)"
+  fi
+
+  # If still no second title, just name as Part 1 / Part 2
+  if [[ -z "${titleB:-}" ]]; then
+    titleA="Part 1"
+    titleB="Part 2"
+  fi
+
+  titleA="$(sanitize_title "$titleA")"
+  titleB="$(sanitize_title "$titleB")"
+
+  # Append quality tag to both if present
+  if [[ -n "${quality:-}" ]]; then
+    titleA="${titleA} ${quality}"
+    titleB="${titleB} ${quality}"
+  fi
+
+  dest1="$OUT_DIR/${show_year} - ${epA_full} - ${titleA}.mkv"
+  dest2="$OUT_DIR/${show_year} - ${epB_full} - ${titleB}.mkv"
+
+  mv -f "${outs[0]}" "$dest1"
+  mv -f "${outs[1]}" "$dest2"
+
+  echo "Wrote: $(basename "$dest1")"
+  echo "Wrote: $(basename "$dest2")"
+
+  rm -rf "$workdir"
+done
+
+echo
+echo "Done. Output in: $OUT_DIR"
+echo "Log: $LOG_FILE"
